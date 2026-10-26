@@ -1,12 +1,35 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeft, ArrowRight, Camera, ChevronLeft, ChevronRight, Code2, Download, Expand, ExternalLink, Github, Grid2X2, LampDesk, Mail, Monitor, Pause, PencilLine, Play, Sparkles, X } from 'lucide-react';
 import { artPath, photoNames, projects, sketchNames, titleCase, type View } from './content';
-import type { WorkspaceScene } from './scene';
+import type { Insets, WorkspaceScene } from './scene';
 
 type Modal = { type: 'project'; id: string } | { type: 'gallery'; kind: 'photography' | 'sketches'; index: number } | { type: 'about' | 'contact' } | null;
 const views: View[] = ['desk', 'work', 'photography', 'sketches'];
 const readView = (): View => { const hash = location.hash.slice(1); return views.includes(hash as View) ? hash as View : 'desk'; };
 const projectIcons = [Sparkles, Code2, Grid2X2, Monitor];
+
+// These queries mirror the layout modes in styles.css (portrait, compact landscape, everything else).
+const PORTRAIT = '(max-aspect-ratio: 85/100)';
+const COMPACT = '(min-aspect-ratio: 85/100) and (max-height: 620px)';
+const NO_INSETS: Insets = { top: 0, right: 0, bottom: 0, left: 0 };
+
+/** How much of the screen the interface covers, so the 3D room can be framed in the space that is left. */
+function measureInsets(root: HTMLElement, state: { exploring: boolean; studio: boolean }): Insets {
+  const portrait = matchMedia(PORTRAIT).matches, compact = !portrait && matchMedia(COMPACT).matches;
+  if (!portrait && !compact) return NO_INSETS;
+  const box = root.getBoundingClientRect();
+  const rect = (selector: string) => { const el = root.querySelector(selector); return el ? el.getBoundingClientRect() : null; };
+  const header = Math.max(rect('.header')?.bottom ?? 0, rect('.back-link')?.bottom ?? 0) - box.top;
+  const footer = rect('.footer'), controls = rect('.book-controls'), note = rect('.explore-note');
+  const bottomEdge = (state.exploring && note ? note.top : state.studio && controls ? controls.top : footer ? footer.top : box.bottom) - box.top;
+  const bottom = Math.max(0, box.height - bottomEdge + 8);
+  if (portrait) {
+    const mark = state.exploring ? null : rect('[data-inset="top"]');
+    return { top: Math.max(header + 8, mark ? mark.bottom - box.top + 10 : 0), right: 0, bottom, left: 0 };
+  }
+  const panel = state.exploring ? null : rect('.content-panel');
+  return { top: header + 6, right: 0, bottom, left: panel ? (panel.right - box.left) * .5 : 0 };
+}
 
 export default function App() {
   const [view, setView] = useState<View>(readView);
@@ -17,11 +40,14 @@ export default function App() {
   const [page, setPage] = useState(0);
   const [modal, setModal] = useState<Modal>(null);
   const [exploring, setExploring] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
   const host = useRef<HTMLDivElement>(null);
   const scene = useRef<WorkspaceScene | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const navigate = useCallback((next: View) => {setExploring(false); setView(next); setPage(0); scene.current?.navigate(next); if (location.hash !== `#${next}`) history.pushState(null, '', `#${next}`);}, []);
   const isStudio = view === 'photography' || view === 'sketches';
+  const syncInsets = useRef(() => {});
+  syncInsets.current = () => { if (root.current) scene.current?.setInsets(measureInsets(root.current, { exploring, studio: isStudio })); };
 
   useEffect(() => {
     let cancelled = false;
@@ -29,13 +55,22 @@ export default function App() {
       if (cancelled || !host.current) return;
       try {
         scene.current = new WorkspaceScene(host.current, { onNavigate: navigate, onReady: () => setReady(true), onPage: setPage, onError: () => {setFailed(true); setReady(true);} });
-        scene.current.navigate(readView());
+        scene.current.navigate(readView()); syncInsets.current();
       } catch (error) {console.error('Unable to initialize the workspace', error); setFailed(true); setReady(true);}
     }).catch(() => {setFailed(true); setReady(true);});
     return () => {cancelled = true; scene.current?.dispose(); scene.current = null;};
   }, [navigate]);
   useEffect(() => {scene.current?.setMotion(motion);}, [motion]);
   useEffect(() => {scene.current?.setLamp(lamp);}, [lamp]);
+  useEffect(() => {
+    syncInsets.current();
+    const el = root.current; if (!el) return;
+    const update = () => syncInsets.current();
+    const observer = new ResizeObserver(update);
+    el.querySelectorAll('.content-panel, .header, .footer, .book-controls, .explore-note, [data-inset]').forEach(node => observer.observe(node)); observer.observe(el);
+    document.fonts?.ready.then(update);
+    return () => observer.disconnect();
+  }, [view, exploring, ready, failed]);
   useEffect(() => {
     const pop = () => {const next = readView(); setExploring(false); setView(next); scene.current?.navigate(next); setModal(null);}; window.addEventListener('popstate', pop);
     return () => window.removeEventListener('popstate', pop);
@@ -55,7 +90,7 @@ export default function App() {
   const selectedProject = modal?.type === 'project' ? projects.find(p => p.id === modal.id) : null;
   const galleryNames = modal?.type === 'gallery' ? (modal.kind === 'photography' ? photoNames : sketchNames) : [];
 
-  return <div className={`workspace view-${view} ${exploring ? 'exploring' : ''} ${ready ? 'is-ready' : ''} ${motion ? '' : 'motion-off'} ${failed ? 'scene-unavailable' : ''}`}>
+  return <div ref={root} className={`workspace view-${view} ${exploring ? 'exploring' : ''} ${ready ? 'is-ready' : ''} ${motion ? '' : 'motion-off'} ${failed ? 'scene-unavailable' : ''}`}>
     <a className="skip-link" href="#main-content" onClick={event => {event.preventDefault(); document.getElementById('main-content')?.focus();}}>Skip to content</a>
     <div ref={host} className="scene" data-testid="workspace-scene" />
     <div className="scene-shade" aria-hidden="true" />
@@ -81,14 +116,14 @@ export default function App() {
           <h1 id="hero-title">Step into<br />my workspace<span>.</span></h1>
           <p className="intro-line">Code. Capture. Create.</p>
           <p className="description">A curious mind at the intersection<br className="desktop-break" /> of engineering and art.</p>
-          <div className="hero-actions"><button className="button primary" onClick={() => {if (failed) {navigate('work'); return;} setExploring(true); scene.current?.explore();}}>Explore the desk <ArrowRight size={17} /></button><button className="text-button" onClick={() => navigate('work')}><Grid2X2 size={15} /> View projects</button></div>
+          <div className="hero-actions" data-inset="top"><button className="button primary" onClick={() => {if (failed) {navigate('work'); return;} setExploring(true); scene.current?.explore();}}>Explore the desk <ArrowRight size={17} /></button><button className="text-button" onClick={() => navigate('work')}><Grid2X2 size={15} /> View projects</button></div>
           <div className="small-note"><span /> A little of what I build. A little of how I see.</div>
         </section>}
 
         {view === 'work' && <section className="work-panel content-panel" aria-labelledby="work-title">
           <div className="eyebrow"><Code2 size={15} /><span>/</span> Engineering</div>
           <h1 id="work-title">Things I build<span>.</span></h1>
-          <p className="description">Turning ideas into useful, real-world tools.<br />From developer productivity to intelligent systems.</p>
+          <p className="description" data-inset="top">Turning ideas into useful, real-world tools.<br />From developer productivity to intelligent systems.</p>
           <div className="project-list">{projects.map((project, i) => {const Icon = projectIcons[i]; return <button className="project-card" key={project.id} onClick={() => setModal({ type: 'project', id: project.id })}>
             <span className="project-icon" style={{ '--project-color': project.color } as React.CSSProperties}><Icon size={24} strokeWidth={1.5} /></span>
             <span><strong>{project.name}</strong><small>{project.short}</small></span><span className="project-arrow"><ChevronRight size={17} /></span>
@@ -104,7 +139,7 @@ export default function App() {
             <button aria-pressed={view === 'photography'} onClick={() => navigate('photography')}><Camera size={15} /> Photography</button>
             <button aria-pressed={view === 'sketches'} onClick={() => navigate('sketches')}><PencilLine size={15} /> Sketches</button>
           </div>
-          <button className="understated-link gallery-button" onClick={() => setModal({ type: 'gallery', kind: view as 'photography' | 'sketches', index: page * 2 })}><Grid2X2 size={14} /> Open collection <ExternalLink size={12} /></button>
+          <button className="understated-link gallery-button" data-inset="top" onClick={() => setModal({ type: 'gallery', kind: view as 'photography' | 'sketches', index: page * 2 })}><Grid2X2 size={14} /> Open collection <ExternalLink size={12} /></button>
         </section>}
       </div>
 
@@ -128,9 +163,9 @@ export default function App() {
     <footer className="footer">
       <div className="location"><span className="footer-dot" /> Made of curiosity <span className="footer-separator">/</span> Based in India</div>
       <nav className="chapter-nav" aria-label="Workspace chapters">
-        <button className={view === 'desk' ? 'active' : ''} onClick={() => navigate('desk')}><span>01</span> The desk</button><span className="chapter-line" />
-        <button className={view === 'work' ? 'active' : ''} onClick={() => navigate('work')}><span>02</span> Engineering</button><span className="chapter-line" />
-        <button className={isStudio ? 'active' : ''} onClick={() => navigate('sketches')}><span>03</span> The studio</button>
+        <button className={view === 'desk' ? 'active' : ''} onClick={() => navigate('desk')}><span>01</span> <b className="full">The desk</b><b className="short">Desk</b></button><span className="chapter-line" />
+        <button className={view === 'work' ? 'active' : ''} onClick={() => navigate('work')}><span>02</span> <b className="full">Engineering</b><b className="short">Work</b></button><span className="chapter-line" />
+        <button className={isStudio ? 'active' : ''} onClick={() => navigate('sketches')}><span>03</span> <b className="full">The studio</b><b className="short">Studio</b></button>
       </nav>
       <div className="settings"><button aria-label={lamp ? 'Dim desk lamp' : 'Turn on desk lamp'} aria-pressed={lamp} onClick={() => setLamp(!lamp)}><LampDesk size={17} /></button><button aria-label={motion ? 'Reduce motion' : 'Enable full motion'} aria-pressed={!motion} onClick={() => setMotion(!motion)}>{motion ? <Pause size={15} /> : <Play size={15} />}</button></div>
     </footer>

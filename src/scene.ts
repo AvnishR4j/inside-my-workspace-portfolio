@@ -7,6 +7,7 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { canvasTexture, paperTexture, textTexture, terminalTexture, keyboardTexture, spineTexture, contactShadow, surfaceRelief, notebookTexture } from './materials';
@@ -14,6 +15,22 @@ import { artPath, photoNames, sketchNames, titleCase, type View } from './conten
 
 type Callbacks = { onNavigate: (view: View) => void; onReady: () => void; onPage: (page: number) => void; onError: () => void };
 const UP = new T.Vector3(0, 1, 0);
+
+// three.js normalises screen-space derivatives in its bump-map shader. On sliver pixels those derivatives
+// can be exactly zero, which produces NaN. A single NaN pixel is smeared across the whole frame by the bloom
+// blur and the room renders black (seen on narrow portrait screens). Normalise defensively instead.
+T.ShaderChunk.bumpmap_pars_fragment = T.ShaderChunk.bumpmap_pars_fragment
+  .replace('vec3 vSigmaX = normalize( dFdx( surf_pos.xyz ) );', 'vec3 vSigmaX = safeNormalize( dFdx( surf_pos.xyz ) );')
+  .replace('vec3 vSigmaY = normalize( dFdy( surf_pos.xyz ) );', 'vec3 vSigmaY = safeNormalize( dFdy( surf_pos.xyz ) );')
+  .replace('return normalize( abs( fDet ) * surf_norm - vGrad );', 'return safeNormalize( abs( fDet ) * surf_norm - vGrad, surf_norm );')
+  .replace('vec3 perturbNormalArb(', 'vec3 safeNormalize( vec3 v, vec3 fallback ) { float l = length( v ); return l > 1e-6 ? v / l : fallback; }\n\tvec3 safeNormalize( vec3 v ) { return safeNormalize( v, vec3( 0.0 ) ); }\n\n\tvec3 perturbNormalArb(');
+
+// Screen-space margins (px) occupied by interface chrome. The scene is shifted/zoomed into the free area.
+export type Insets = { top: number; right: number; bottom: number; left: number };
+type Frame = { zoom: number; x: number; y: number };
+const NO_INSETS: Insets = { top: 0, right: 0, bottom: 0, left: 0 };
+const FRAME_FIT = .4;
+const FRAME_MIN_ZOOM = .8;
 const POSES: Record<View, { position: number[]; target: number[]; fov: number }> = {
   desk: { position: [3.9, 3.85, 5.6], target: [-.65, 1.68, -.32], fov: 48 },
   work: { position: [1.9, 3.35, 4.5], target: [-.85, 1.75, -.55], fov: 39 },
@@ -44,6 +61,10 @@ export class WorkspaceScene {
   private basePosition = new T.Vector3();
   private fromFov = 43;
   private toFov = 43;
+  private insets: Insets = NO_INSETS;
+  private viewFrame: Frame = { zoom: 1, x: 0, y: 0 };
+  private fromFrame: Frame = { zoom: 1, x: 0, y: 0 };
+  private toFrame: Frame = { zoom: 1, x: 0, y: 0 };
   private transitionStart = 0;
   private transitioning = false;
   private reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -123,6 +144,12 @@ export class WorkspaceScene {
     this.ao.blendIntensity = .55; this.composer.addPass(this.ao);
     this.depthOfField = new BokehPass(this.scene, this.camera, { focus: 6, aperture: .00085, maxblur: .004 });
     this.composer.addPass(this.depthOfField);
+    // Guard: any invalid HDR value would otherwise be spread over the frame by the bloom blur.
+    this.composer.addPass(new ShaderPass({
+      uniforms: { tDiffuse: { value: null } },
+      vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 ); }',
+      fragmentShader: 'uniform sampler2D tDiffuse; varying vec2 vUv; void main() { vec4 c = texture2D( tDiffuse, vUv ); bool bad = any( isnan( c ) ) || any( isinf( c ) ); gl_FragColor = bad ? vec4( 0.0, 0.0, 0.0, 1.0 ) : vec4( clamp( c.rgb, 0.0, 64.0 ), c.a ); }',
+    }));
     this.composer.addPass(new UnrealBloomPass(new T.Vector2(host.clientWidth, host.clientHeight), .12, .55, 1.15));
     this.composer.addPass(new OutputPass());
     this.setPose('desk', true);
@@ -545,9 +572,15 @@ export class WorkspaceScene {
   }
   private resize = () => {
     const { width, height } = this.host.getBoundingClientRect();
-    this.camera.aspect = width / height; this.camera.updateProjectionMatrix(); this.renderer.setSize(width, height); this.composer?.setSize(width, height);
+    if (!width || !height) return;
+    this.camera.aspect = width / height; this.renderer.setSize(width, height); this.composer?.setSize(width, height);
     this.setPose(this.view, true);
   };
+  /** Portrait layouts keep a constant horizontal field of view so the desk keeps its width on any aspect ratio. */
+  private portraitFov(base: number, horizontal: number) {
+    const vertical = 2 * Math.atan(Math.tan(T.MathUtils.degToRad(horizontal) / 2) / this.camera.aspect);
+    return T.MathUtils.clamp(T.MathUtils.radToDeg(vertical), base, 82);
+  }
   private setPose(view: View, immediate = false) {
     const p = POSES[view]; const mobile = this.camera.aspect < .85;
     this.fromPosition.copy(this.basePosition.lengthSq() ? this.basePosition : this.camera.position); this.fromTarget.copy(this.lookAt);
@@ -557,9 +590,27 @@ export class WorkspaceScene {
       else if (view === 'work') {this.toPosition.set(1.1, 3.8, 5.4); this.toTarget.set(-.5, 1.7, -.25);}
       else {this.toPosition.set(.5, 5.6, 3.55); this.toTarget.set(.28, 1.2, .85);}
     }
-    this.fromFov = this.camera.fov; this.toFov = mobile ? (view === 'sketches' || view === 'photography' ? 58 : 50) : p.fov;
+    this.fromFov = this.camera.fov; this.toFov = mobile ? this.portraitFov(view === 'sketches' || view === 'photography' ? 58 : 50, view === 'desk' ? 40 : 38) : p.fov;
+    this.fromFrame = { ...this.viewFrame }; this.toFrame = this.frameFor();
     this.transitionStart = performance.now(); this.transitioning = !immediate;
-    if (immediate || this.reduced || this.still) { this.basePosition.copy(this.toPosition); this.lookAt.copy(this.toTarget); this.camera.fov = this.toFov; this.camera.updateProjectionMatrix(); this.transitioning = false; }
+    if (immediate || this.reduced || this.still) { this.basePosition.copy(this.toPosition); this.lookAt.copy(this.toTarget); this.camera.fov = this.toFov; this.viewFrame = { ...this.toFrame }; this.applyCamera(); this.transitioning = false; }
+  }
+  /** Where the scene should sit on screen: centred in whatever the interface chrome leaves free. */
+  private frameFor(): Frame {
+    const W = this.host.clientWidth, H = this.host.clientHeight; const { top, right, bottom, left } = this.insets;
+    if (!W || !H || (!top && !right && !bottom && !left)) return { zoom: 1, x: 0, y: 0 };
+    const fit = Math.min((W - left - right) / W, (H - top - bottom) / H);
+    return { zoom: T.MathUtils.clamp(fit / FRAME_FIT, FRAME_MIN_ZOOM, 1), x: (left - right) / 2, y: (top - bottom) / 2 };
+  }
+  private applyCamera() {
+    const W = this.host.clientWidth, H = this.host.clientHeight; this.camera.zoom = this.viewFrame.zoom;
+    if ((this.viewFrame.x || this.viewFrame.y) && W && H) this.camera.setViewOffset(W, H, -this.viewFrame.x, -this.viewFrame.y, W, H); else this.camera.clearViewOffset();
+    this.camera.updateProjectionMatrix();
+  }
+  setInsets(next: Insets) {
+    const same = (['top', 'right', 'bottom', 'left'] as const).every(k => Math.abs(this.insets[k] - next[k]) < 1);
+    if (same) return; this.insets = next; this.toFrame = this.frameFor();
+    if (!this.transitioning) { this.fromFrame = { ...this.toFrame }; this.viewFrame = { ...this.toFrame }; this.applyCamera(); }
   }
   navigate(view: View) {
     this.drag = null; this.view = view; this.host.dataset.view = view; this.setPose(view);
@@ -571,9 +622,10 @@ export class WorkspaceScene {
     this.fromPosition.copy(this.basePosition); this.fromTarget.copy(this.lookAt); this.fromFov = this.camera.fov;
     const mobile = this.camera.aspect < .85;
     this.toPosition.set(mobile ? 2.1 : 3.45, mobile ? 5.0 : 3.55, mobile ? 6.6 : 4.6);
-    this.toTarget.set(.05, mobile ? 1.75 : 1.45, .1); this.toFov = mobile ? 55 : 48;
+    this.toTarget.set(.05, mobile ? 1.75 : 1.45, .1); this.toFov = mobile ? this.portraitFov(55, 40) : 48;
+    this.fromFrame = { ...this.viewFrame }; this.toFrame = this.frameFor();
     this.transitionStart = performance.now(); this.transitioning = true;
-    if (this.reduced || this.still) {this.basePosition.copy(this.toPosition); this.lookAt.copy(this.toTarget); this.camera.fov = this.toFov; this.camera.updateProjectionMatrix(); this.transitioning = false;}
+    if (this.reduced || this.still) {this.basePosition.copy(this.toPosition); this.lookAt.copy(this.toTarget); this.camera.fov = this.toFov; this.viewFrame = { ...this.toFrame }; this.applyCamera(); this.transitioning = false;}
   }
   setMotion(enabled: boolean) { this.still = !enabled; }
   setLamp(enabled: boolean) { this.lampOn = enabled; if (this.reduced || this.still) this.lampLight.intensity = enabled ? 14 : .25; }
@@ -635,7 +687,7 @@ export class WorkspaceScene {
         const direction = dx < 0 ? 1 : -1;
         if (this.bookPage + direction >= 0 && this.bookPage + direction <= 6) {this.drag.active = true; this.prepareTurn(direction);}
       }
-      if (this.drag.active) {this.drag.progress = T.MathUtils.clamp(-dx * this.turn.direction / (window.innerWidth < 700 ? 180 : 350), 0, .99); this.turn.value = this.drag.progress; this.deformPage(this.turn.value);}
+      if (this.drag.active) {this.drag.progress = T.MathUtils.clamp(-dx * this.turn.direction / (this.host.clientWidth < 700 ? 180 : 350), 0, .99); this.turn.value = this.drag.progress; this.deformPage(this.turn.value);}
     }
     const hit = this.pick(e); this.renderer.domElement.style.cursor = this.drag?.active ? 'grabbing' : hit ? ((this.view === 'sketches' || this.view === 'photography') ? 'grab' : 'pointer') : 'default';
   };
@@ -661,7 +713,8 @@ export class WorkspaceScene {
     if (this.transitioning) {
       const t = T.MathUtils.clamp((now - this.transitionStart) / 1650, 0, 1); const ease = t * t * t * (t * (t * 6 - 15) + 10);
       this.basePosition.lerpVectors(this.fromPosition, this.toPosition, ease); this.basePosition.y += Math.sin(t * Math.PI) ** 2 * .24;
-      this.lookAt.lerpVectors(this.fromTarget, this.toTarget, ease); this.camera.fov = T.MathUtils.lerp(this.fromFov, this.toFov, ease); this.camera.updateProjectionMatrix();
+      this.lookAt.lerpVectors(this.fromTarget, this.toTarget, ease); this.camera.fov = T.MathUtils.lerp(this.fromFov, this.toFov, ease);
+      this.viewFrame = { zoom: T.MathUtils.lerp(this.fromFrame.zoom, this.toFrame.zoom, ease), x: T.MathUtils.lerp(this.fromFrame.x, this.toFrame.x, ease), y: T.MathUtils.lerp(this.fromFrame.y, this.toFrame.y, ease) }; this.applyCamera();
       if (t === 1) this.transitioning = false;
     }
     this.camera.position.copy(this.basePosition);
@@ -676,15 +729,38 @@ export class WorkspaceScene {
     const lightTarget = this.lampOn ? 14 : .25;
     this.lampLight.intensity = T.MathUtils.lerp(this.lampLight.intensity, lightTarget, 1 - Math.exp(-dt * .008));
     (this.lampGlow.material as T.MeshBasicMaterial).color.setRGB(.4 + this.lampLight.intensity / 23, .34 + this.lampLight.intensity / 42, .22 + this.lampLight.intensity / 63);
-    if (this.view === 'desk') for (const [name, object] of Object.entries(this.anchors)) {
-      const el = document.querySelector<HTMLElement>(`[data-anchor="${name}"]`); if (!el) continue;
-      const pos = object.getWorldPosition(new T.Vector3()); if (name === 'laptop') pos.y += .7; if (name === 'camera') pos.y += .35; if (name === 'book') pos.y += .15;
-      pos.project(this.camera); const w = this.host.clientWidth, h = this.host.clientHeight;
-      el.style.transform = `translate(${(pos.x + 1) * w / 2}px,${(-pos.y + 1) * h / 2}px) translate(-50%,-50%)`;
-    }
+    if (this.view === 'desk') this.placeHotspots();
     this.composer.render(); this.host.dataset.transitioning = String(this.transitioning); this.host.dataset.page = String(this.bookPage + 1);
     this.frame = requestAnimationFrame(this.animate);
   };
+  /** Projects the desk objects to screen, keeps the labels on screen and nudges them apart if they would touch. */
+  private placeHotspots() {
+    const w = this.host.clientWidth, h = this.host.clientHeight; const spots: { el: HTMLElement; x: number; y: number; hw: number; hh: number }[] = [];
+    for (const [name, object] of Object.entries(this.anchors)) {
+      const el = document.querySelector<HTMLElement>(`[data-anchor="${name}"]`); if (!el) continue;
+      const pos = object.getWorldPosition(new T.Vector3()); if (name === 'laptop') pos.y += .7; if (name === 'camera') pos.y += .35; if (name === 'book') pos.y += .15;
+      pos.project(this.camera);
+      spots.push({ el, x: (pos.x + 1) * w / 2, y: (-pos.y + 1) * h / 2, hw: el.offsetWidth / 2 + 12, hh: el.offsetHeight / 2 });
+    }
+    const keep = (spot: typeof spots[number]) => {
+      spot.x = T.MathUtils.clamp(spot.x, spot.hw, Math.max(spot.hw, w - spot.hw));
+      spot.y = T.MathUtils.clamp(spot.y, Math.min(h / 2, 86 + spot.hh), Math.max(h / 2, h - 96 - spot.hh));
+    };
+    spots.forEach(keep);
+    const gap = 8;
+    for (let pass = 0; pass < 8; pass++) {
+      let moved = false;
+      for (let a = 0; a < spots.length; a++) for (let b = a + 1; b < spots.length; b++) {
+        const first = spots[a], second = spots[b]; const dx = second.x - first.x, dy = second.y - first.y;
+        const overlapX = first.hw + second.hw - 12 + gap - Math.abs(dx), overlapY = first.hh + second.hh + gap - Math.abs(dy);
+        if (overlapX <= 0 || overlapY <= 0) continue; moved = true;
+        if (overlapY <= overlapX) { const push = overlapY / 2 * (dy >= 0 ? 1 : -1); first.y -= push; second.y += push; }
+        else { const push = overlapX / 2 * (dx >= 0 ? 1 : -1); first.x -= push; second.x += push; }
+      }
+      spots.forEach(keep); if (!moved) break;
+    }
+    for (const spot of spots) spot.el.style.transform = `translate(${spot.x}px,${spot.y}px) translate(-50%,-50%)`;
+  }
   dispose() {
     this.disposed = true; cancelAnimationFrame(this.frame); this.resizeObserver.disconnect();
     const el = this.renderer.domElement; el.removeEventListener('pointerdown', this.pointerDown); el.removeEventListener('pointermove', this.pointerMove); el.removeEventListener('pointerup', this.pointerUp); el.removeEventListener('pointercancel', this.pointerCancel); el.removeEventListener('webglcontextlost', this.contextLost); document.removeEventListener('visibilitychange', this.visibility);
