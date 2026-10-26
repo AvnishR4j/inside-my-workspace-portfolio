@@ -1,0 +1,6 @@
+artifacts/
+scripts/
+QA.md
+README.md
+*.tsbuildinfo
+.env*
